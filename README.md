@@ -29,7 +29,7 @@ codex-model-router (node, 127.0.0.1:4141, systemd user service)
 ## 安装
 
 ```bash
-git clone git@github.com:thomas-hiddenpeak/codex-local-model-router.git
+git clone https://github.com/thomas-hiddenpeak/codex-local-model-router.git
 cd codex-local-model-router
 
 # 默认参数 (vLLM=http://192.168.0.159:58000/v1, 模型名="RM-01 VLM")
