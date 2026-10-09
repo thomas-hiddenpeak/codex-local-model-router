@@ -22,7 +22,8 @@
 #   - CODEX_ROUTER_LOG=1 落盘日志, CODEX_ROUTER_DUMP=<dir> 落盘完整请求/响应
 #
 # 脚本做的事 (幂等, 可重复执行):
-#   1. 前置检查: node (>=23.8, 需 zstd) / codex / vLLM 可达 / ChatGPT 登录态
+#   1. 前置检查 + 自动安装: node (PATH -> nvm -> 官方 tarball, 均免 root) /
+#      codex (npm 全局) / vLLM 可达 / ChatGPT 登录态
 #   2. 安装 router 到 ~/.codex/model-router/codex-router.js
 #   3. 安装 systemd user service codex-model-router (无 systemd 时回退 nohup)
 #   4. 生成 ~/.codex/model-catalog.merged.json
@@ -108,17 +109,99 @@ EOF
 esac
 
 # ----------------------------------------------------------------------------
-# 1. 前置检查
+# 1. 前置检查 (缺失自动安装: node -> codex)
 # ----------------------------------------------------------------------------
 step "前置检查"
 
-NODE_BIN="$(command -v node || true)"
-[ -n "${NODE_BIN}" ] || die "未找到 node, 请先安装 (nvm install 24 推荐)"
-"${NODE_BIN}" -e 'const z=require("zlib");z.zstdDecompressSync(z.zstdCompressSync(Buffer.from("{}")))' \
-  || die "node 缺少 zstd 支持, 需要 Node >= 23.8 (推荐 24+): 当前 $(${NODE_BIN} --version)"
-echo "node: ${NODE_BIN} ($(${NODE_BIN} --version))"
+# 下载助手: 优先 curl, 回退 wget
+download() { # $1=url $2=目标文件
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$1" -o "$2"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$2" "$1"
+  else
+    die "需要 curl 或 wget, 请先安装其一"
+  fi
+}
 
-command -v codex >/dev/null 2>&1 || die "未找到 codex CLI, 请先安装 (npm i -g @openai/codex)"
+# 安装官方 node tarball 到 ${ROUTER_DIR}/runtime/node (免 root, 路径稳定)
+install_node_bundled() {
+  local arch ver tmp tmpjson
+  case "$(uname -m)" in
+    x86_64) arch=x64 ;;
+    aarch64) arch=arm64 ;;
+    *) die "不支持的架构: $(uname -m) (仅支持 x86_64/aarch64)" ;;
+  esac
+  tmpjson="$(mktemp)"
+  download "https://nodejs.org/dist/index.json" "${tmpjson}" \
+    || die "无法获取 node 版本列表 (检查网络/代理)"
+  ver="$(tr ',' '\n' < "${tmpjson}" | grep -o '"version":"v24\.[0-9]*\.[0-9]*"' | head -1 | sed 's/^"version":"//; s/"$//')"
+  rm -f "${tmpjson}"
+  [ -n "${ver}" ] || die "解析 node v24 最新版本号失败"
+  warn "安装 node ${ver} (linux-${arch}) 到 ${ROUTER_DIR}/runtime/node (免 root) ..."
+  mkdir -p "${ROUTER_DIR}/runtime"
+  tmp="$(mktemp)"
+  download "https://nodejs.org/dist/${ver}/node-${ver}-linux-${arch}.tar.xz" "${tmp}" \
+    || die "下载 node ${ver} 失败"
+  tar -xJf "${tmp}" -C "${ROUTER_DIR}/runtime" || die "解压 node 失败"
+  rm -f "${tmp}"
+  rm -rf "${ROUTER_DIR}/runtime/node"
+  mv "${ROUTER_DIR}/runtime/node-${ver}-linux-${arch}" "${ROUTER_DIR}/runtime/node"
+  NODE_BIN="${ROUTER_DIR}/runtime/node/bin/node"
+}
+
+# --- node: PATH (需支持 zstd) -> nvm -> 官方 tarball ---
+NODE_BIN=""
+if command -v node >/dev/null 2>&1 \
+  && node -e 'const z=require("zlib");z.zstdDecompressSync(z.zstdCompressSync(Buffer.from("{}")))' 2>/dev/null; then
+  NODE_BIN="$(command -v node)"
+  echo "node: ${NODE_BIN} ($(${NODE_BIN} --version))"
+else
+  if command -v node >/dev/null 2>&1; then
+    warn "PATH 中的 node ($(node --version 2>/dev/null)) 缺少 zstd 支持 (需 >= 23.8), 将安装独立 node"
+  fi
+  export NVM_DIR="${NVM_DIR:-${HOME}/.nvm}"
+  if [ -s "${NVM_DIR}/nvm.sh" ]; then
+    # shellcheck disable=SC1091
+    . "${NVM_DIR}/nvm.sh" >/dev/null 2>&1
+    nvm install 24 >/dev/null 2>&1 || die "nvm install 24 失败"
+    NODE_BIN="${NVM_DIR}/versions/node/$(nvm version 24)/bin/node"
+    echo "node (nvm): ${NODE_BIN} ($(${NODE_BIN} --version))"
+  else
+    install_node_bundled
+    echo "node (内置): ${NODE_BIN} ($(${NODE_BIN} --version))"
+  fi
+fi
+
+# --- codex: PATH -> npm 全局安装 (用已解析 node 的 npm) ---
+if ! command -v codex >/dev/null 2>&1; then
+  warn "未找到 codex CLI, 用 npm 自动安装 @openai/codex ..."
+  # npm 是 #!/usr/bin/env node 脚本, PATH 无 node 时须用 node 显式调用
+  if ! "${NODE_BIN}" "$(dirname "${NODE_BIN}")/npm" install -g @openai/codex >/dev/null 2>&1; then
+    # 系统 npm 可能无写权限 (需 root); 回退到内置 node 前缀重试
+    install_node_bundled
+    "${NODE_BIN}" "$(dirname "${NODE_BIN}")/npm" install -g @openai/codex >/dev/null 2>&1 \
+      || die "安装 @openai/codex 失败 (检查网络/npm 源)"
+  fi
+  if ! command -v codex >/dev/null 2>&1; then
+    # 安装位置不在 PATH: 在 ~/.local/bin 生成 wrapper (用绝对路径 node 显式调用)。
+    # 不能裸符号链接: codex bin 是 #!/usr/bin/env node 脚本, PATH 无 node 时无法运行。
+    # rm -f 必须先于写入: 若残留旧版符号链接, cat > 会跟随链接写穿, 损坏包内真实文件。
+    mkdir -p "${HOME}/.local/bin"
+    rm -f "${HOME}/.local/bin/codex"
+    cat > "${HOME}/.local/bin/codex" <<WRAPPER_EOF
+#!/bin/sh
+exec "${NODE_BIN}" "$(dirname "${NODE_BIN}")/codex" "\$@"
+WRAPPER_EOF
+    chmod +x "${HOME}/.local/bin/codex"
+    case ":${PATH}:" in
+      *":${HOME}/.local/bin:"*) ;;
+      *) warn "codex 已安装到 ~/.local/bin/codex; ~/.local/bin 不在 PATH, 请加入 (export PATH=\"\$HOME/.local/bin:\$PATH\")" ;;
+    esac
+    export PATH="${HOME}/.local/bin:${PATH}"
+  fi
+fi
+command -v codex >/dev/null 2>&1 || die "codex 安装后仍不可用, 请手动执行: ${NODE_BIN} $(dirname "${NODE_BIN}")/npm install -g @openai/codex"
 echo "codex: $(codex --version 2>/dev/null || echo 未知版本)"
 
 # vLLM 可达性
@@ -155,7 +238,12 @@ s.listen('"${ROUTER_PORT}"',"127.0.0.1",()=>{s.close(()=>process.exit(0))});
 ' 2>/dev/null; then
   echo "端口 ${ROUTER_PORT}: 空闲"
 else
-  curl -fsS "http://127.0.0.1:${ROUTER_PORT}/health" >/dev/null 2>&1 \
+  "${NODE_BIN}" -e '
+const http=require("http");
+const r=http.get("http://127.0.0.1:'"${ROUTER_PORT}"'/health",res=>process.exit(res.statusCode===200?0:1));
+r.on("error",()=>process.exit(1));
+r.setTimeout(2000,()=>process.exit(1));
+' 2>/dev/null \
     && echo "端口 ${ROUTER_PORT}: 已被本 router 占用 (将重启)" \
     || die "端口 ${ROUTER_PORT} 被其他进程占用"
 fi

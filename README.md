@@ -20,11 +20,12 @@ codex-model-router (node, 127.0.0.1:4141, systemd user service)
 
 | 组件 | 要求 |
 |---|---|
-| node | ≥ 23.8（需原生 `zlib.zstdDecompressSync`），推荐 24+ |
-| codex CLI | 较新版本（需 `codex debug models` 命令，0.159+ 已验证） |
+| node | ≥ 23.8（需原生 `zlib.zstdDecompressSync`）。**缺失时自动安装**：PATH 已有 → 直接用；否则 nvm（若已装）→ 官方 tarball 到 `~/.codex/model-router/runtime/node`（免 root） |
+| codex CLI | 较新版本（需 `codex debug models` 命令，0.159+ 已验证）。**缺失时自动 `npm install -g @openai/codex`**，必要时链接到 `~/.local/bin` |
 | vLLM | 任意 OpenAI 兼容端点（`/v1/responses` 或 `/v1/chat/completions` 均可，codex 用 responses API） |
 | 登录态 | `~/.codex/auth.json`（ChatGPT 登录，兜底路由 GPT 模型需要；仅用本地模型可无） |
 | systemd | 可选；无 systemd user 时自动回退 nohup |
+| 网络 | 自动安装时需要能访问 nodejs.org / npmjs.org（或配置代理） |
 
 ## 安装
 
