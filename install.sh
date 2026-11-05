@@ -525,7 +525,19 @@ function requestHeaders(req, route, body) {
 function summaryTranscript(input) {
   const native = [];
   const media = [];
-  const visible = input.filter((item) => item && !['compaction_trigger', 'reasoning'].includes(item.type));
+  const visible = input.flatMap((item) => {
+    if (!item || item.type === 'compaction_trigger') return [];
+    if (item.type !== 'reasoning') return [item];
+    // Local models may put all analysis in plaintext reasoning, with no assistant
+    // message before the next tool call. Keep that visible work as historical
+    // data; ciphertext and provider-specific reasoning IDs are never replayed.
+    const parts = [...(Array.isArray(item.summary) ? item.summary : []),
+      ...(Array.isArray(item.content) ? item.content : [])];
+    const text = [...new Set(parts.filter((part) =>
+      ['reasoning_text', 'summary_text', 'text'].includes(part?.type) && typeof part.text === 'string'
+    ).map((part) => part.text))].join('\n');
+    return text.trim() ? [{ type: 'historical_reasoning', text }] : [];
+  });
   const transcript = JSON.stringify(visible, (key, value) => {
     if (['encrypted_content', 'encrypted_function_args', 'internal_chat_message_metadata_passthrough'].includes(key)) return undefined;
     if (value && value.type === 'compaction') {

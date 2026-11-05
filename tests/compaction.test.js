@@ -68,6 +68,40 @@ test('cloud compaction and repeated compaction produce portable cumulative summa
   for (const fact of [...expected, 'Cursor_checksum_9b7e']) assert.ok(output.includes(fact));
 });
 
+test('reasoning/tool-only progress survives three Codex V2 retention cycles and model switches', async (t) => {
+  const f = await fixture(t);
+  const user = message('user', 'FACT goal=Plan_before_implementing');
+  const facts = ['Plan_before_implementing', 'Visible_prior_decision_S4'];
+  let input = [user, { type: 'reasoning', id: 'provider-only-id',
+    encrypted_content: 'opaque-provider-secret',
+    summary: [{ type: 'summary_text', text: 'FACT prior=Visible_prior_decision_S4' }],
+  }];
+  for (let round = 0; round < 3; round++) {
+    input.push({ type: 'reasoning', summary: [], content: [
+      { type: 'reasoning_text', text: 'FACT decision=Candidate_' + round },
+    ] }, { type: 'function_call', name: 'exec_command', call_id: 'call_' + round,
+      arguments: JSON.stringify({ cmd: 'read fixture ' + round }) },
+    { type: 'function_call_output', call_id: 'call_' + round, output: 'FACT verified=Budget_' + round });
+    facts.push('Candidate_' + round, 'Budget_' + round);
+    const model = round === 1 ? 'gpt-test' : 'LOCAL model';
+    const item = checkpoint(await request(f.url, compact(model, input)));
+    // Match Codex V2: original assistant/reasoning/tool items are discarded.
+    input = [user, item];
+    const nextModel = round === 1 ? 'LOCAL model' : 'gpt-test';
+    const result = await request(f.url, { model: nextModel, input });
+    const restored = JSON.stringify(result.json.output);
+    for (const fact of facts) assert.ok(restored.includes(fact), 'round ' + round + ' lost ' + fact);
+    const forwarded = (nextModel.startsWith('LOCAL') ? f.local : f.cloud).requests.at(-1).body.input;
+    assert.ok(forwarded.every((entry) => entry.type === 'message'));
+    if (round === 1) await f.restart();
+  }
+  const summaryInputs = JSON.stringify([...f.local.requests, ...f.cloud.requests]
+    .filter((entry) => entry.summary).map((entry) => entry.body.input));
+  assert.ok(summaryInputs.includes('historical_reasoning'));
+  assert.ok(!summaryInputs.includes('provider-only-id'));
+  assert.ok(!summaryInputs.includes('opaque-provider-secret'));
+});
+
 test('long history is consumed in bounded overlapping chunks with truthful summed usage', async (t) => {
   const f = await fixture(t);
   const input = [...history, message('assistant', 'padding '.repeat(6000) + ' FACT end=Final_constraint_Z8')];
