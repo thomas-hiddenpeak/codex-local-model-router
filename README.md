@@ -129,10 +129,21 @@ codex        # 或你的启动方式, 如 codex --yolo
   迁移机器需要同时迁移会话及该状态目录。**备份状态目录；不要将密钥提交到 Git。**
   当前 `--uninstall` 会删除整个 router 目录，也会删除默认密钥；卸载前需要自行备份。
 - 旧版固定占位符 `router_local_compaction_v1` 原本就没有摘要，无法事后恢复。
-  遇到它会明确报错，需要从压缩前的原始会话记录恢复，不能靠生成新密钥修复。
+  遇到它默认明确报错，需要从压缩前的原始会话记录恢复，不能靠生成新密钥修复。
   若任务压缩后反复从查看仓库、阅读同一批文档开始，应核对保存的 compaction
   是否仍是该占位符。重新达到 token 阈值不等于压缩接口重试；可能是丢失进展后
   重复探索。升级前应先保留原始会话记录，已有空检查点不会随升级自动补出摘要。
+  暂停受影响的会话、备份原始记录并人工核对续接摘要后，可显式执行：
+
+  ```bash
+  node tools/recover-legacy.js --state-dir ~/.codex/model-router/state \
+    --thread-id THREAD_ID --summary-file /absolute/path/summary.txt \
+    --source-file /absolute/path/original-rollout.jsonl
+  ```
+
+  工具生成加密恢复文件并记录原始记录的 SHA256，拒绝覆盖已有恢复文件。
+  router 仅在请求的 thread/session ID 与该文件一致时恢复旧占位符；其他会话仍然拒绝。
+  后续成功压缩产生普通新版检查点后，不再依赖这份会话专用恢复文件。
 - 既有的云端原生 compaction 只能由原云端解码。可在原云端模型上通过新版 router
   再压缩一次，转换为可跨后端恢复的检查点；直接切到本地会返回 409。
 - 压缩需要完整 `input`，不支持只凭 `previous_response_id` 获取隐含历史。

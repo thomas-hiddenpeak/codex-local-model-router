@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const { execFileSync } = require('node:child_process');
 const { fixture, request, message } = require('./router-fixture');
 
 const history = [
@@ -164,6 +165,37 @@ test('tampered checkpoints, missing keys and old placeholders fail without forwa
   await f.restart();
   assert.equal((await request(f.url, followup('LOCAL model', item))).status, 409);
   assert.equal(f.local.requests.length + f.cloud.requests.length, before);
+});
+
+test('explicit legacy recovery is isolated to one thread and becomes a portable checkpoint', async (t) => {
+  const f = await fixture(t);
+  const summary = path.join(f.dir, 'recovered.txt');
+  const source = path.join(f.dir, 'original.jsonl');
+  fs.writeFileSync(summary, 'FACT recovered=Original_decision_R7');
+  fs.writeFileSync(source, '{"original":"fixture"}\n');
+  execFileSync(process.execPath, [path.join(__dirname, '..', 'tools', 'recover-legacy.js'),
+    '--state-dir', path.join(f.dir, 'state'), '--thread-id', 'thread-recovered',
+    '--summary-file', summary, '--source-file', source]);
+  const input = [{ type: 'compaction', encrypted_content: 'router_local_compaction_v1' }, ...history];
+  const metadata = { thread_id: 'thread-recovered', session_id: 'thread-recovered' };
+  for (const model of ['LOCAL model', 'gpt-test']) {
+    const r = await request(f.url, { model, input, client_metadata: metadata });
+    assert.equal(r.status, 200, r.text);
+    assert.ok(JSON.stringify(r.json.output).includes('Original_decision_R7'));
+  }
+  for (const client_metadata of [{}, { thread_id: 'another-thread' },
+    { thread_id: '../thread-recovered' }, { ...metadata, session_id: 'another-thread' }]) {
+    assert.equal((await request(f.url, { model: 'LOCAL model', input, client_metadata })).status, 409);
+  }
+  await f.restart();
+  const item = checkpoint(await request(f.url, { ...compact('LOCAL model', input), client_metadata: metadata }));
+  const file = path.join(f.dir, 'state', 'legacy-recoveries', 'thread-recovered.json');
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.match(JSON.parse(fs.readFileSync(file)).source_sha256, /^[a-f0-9]{64}$/);
+  fs.unlinkSync(file);
+  const restored = await request(f.url, followup('gpt-test', item));
+  assert.ok(JSON.stringify(restored.json.output).includes('Original_decision_R7'));
+  assert.equal((await request(f.url, { model: 'LOCAL model', input, client_metadata: metadata })).status, 409);
 });
 
 test('cloud encrypted reasoning is omitted on a local switch while visible context survives', async (t) => {

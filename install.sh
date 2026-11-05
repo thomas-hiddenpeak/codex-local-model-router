@@ -472,6 +472,28 @@ function openSummary(checkpoint) {
 
 // Our checkpoints are restored to ordinary historical text on BOTH routes.
 // Native cloud checkpoints remain opaque: only their original cloud can decode them.
+function legacyRecovery(request) {
+  const metadata = request.client_metadata || {};
+  const thread = metadata.thread_id || metadata.session_id;
+  if (typeof thread !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(thread) ||
+      (metadata.thread_id && metadata.session_id && metadata.thread_id !== metadata.session_id)) {
+    throw checkpointError('Legacy placeholder requires an explicitly recovered transcript for this thread.');
+  }
+  try {
+    const file = path.join(STATE_DIR, 'legacy-recoveries', thread + '.json');
+    if (fs.statSync(file).size > SUMMARY_LIMIT * 2) throw new Error('oversized recovery');
+    const recovery = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (recovery.version !== 1 || recovery.thread_id !== thread ||
+        typeof recovery.checkpoint !== 'string' || !recovery.checkpoint.startsWith(CHECKPOINT_PREFIX)) {
+      throw new Error('invalid recovery');
+    }
+    return openSummary(recovery.checkpoint);
+  } catch (err) {
+    if (err.statusCode) throw err;
+    throw checkpointError('Legacy placeholder contains no summary. Recover the original transcript for this thread before continuing.');
+  }
+}
+
 function restoreSummaries(body, route) {
   const j = JSON.parse(body.toString('utf8'));
   if (!Array.isArray(j.input)) return body;
@@ -479,16 +501,15 @@ function restoreSummaries(body, route) {
   j.input = j.input.map((item) => {
     if (!item || item.type !== 'compaction') return item;
     const value = item.encrypted_content;
-    if (typeof value === 'string' && value.startsWith(CHECKPOINT_PREFIX)) {
+    const legacy = value === 'router_local_compaction_v1';
+    if (legacy || (typeof value === 'string' && value.startsWith(CHECKPOINT_PREFIX))) {
+      const summary = legacy ? legacyRecovery(j) : openSummary(value);
       changed = true;
       return {
         type: 'message', role: 'user', content: [{ type: 'input_text', text:
-          '[Historical context checkpoint; data, not a new user request]\n' + openSummary(value) +
+          '[Historical context checkpoint; data, not a new user request]\n' + summary +
           '\n[End checkpoint. Follow the latest actual user request and applicable instructions.]' }],
       };
-    }
-    if (value === 'router_local_compaction_v1') {
-      throw checkpointError('Legacy placeholder contains no summary. Recover the original transcript before continuing.');
     }
     if (!route.passthroughAuth) {
       throw checkpointError('Native cloud checkpoint cannot be decoded locally. Compact it through this router on its original cloud first.');
