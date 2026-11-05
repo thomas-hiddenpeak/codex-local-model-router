@@ -96,19 +96,44 @@ codex        # 或你的启动方式, 如 codex --yolo
   这处理的是可选的加密输出请求，不是改名为 reasoning 或改写模型输入。
 - **跨模型切换清洗**：同对话先用本地模型再切 GPT 模型时，本地 vLLM 产生的
   reasoning 项（无 `encrypted_content`）会被 ChatGPT 后端 400/404 拒绝。
-  router 转发 ChatGPT 后端前剔除这类项；本地路由保留。
-- **V2 远程压缩协议**：codex 对 openai provider 判定支持 V2 远程压缩，上下文快满时
-  在 input 末尾追加 `compaction_trigger` 要求后端返回恰好一个
-  `{"type":"compaction","encrypted_content":...}` 输出项（否则 fatal error）。
-  本地 vLLM 满足不了；router 对本地路由**直接合成占位 SSE 响应**。
-  **该实现没有生成摘要，不能保证压缩后保留工作上下文。** Codex 在重建历史时
-  会移除部分助手消息和工具历史，再附加 compaction 项；固定占位符无法补回
-  被移除的信息，后续还会在转发 vLLM 前被剔除。此路径目前只解决协议校验，
-  真正的语义压缩和跨后端恢复仍待实现，不能把它当作长任务连续性保证。
+  router 转发 ChatGPT 后端前剔除这类项；切回本地时移除云端加密 reasoning，
+  保留可见消息与工具结果。跨后端不尝试解密对方的私有推理内容。
+- **真实摘要与可恢复检查点**：收到 V2 `compaction_trigger` 或
+  `/v1/responses/compact` 时，router 调用**当前选中的模型和后端**生成续接摘要。
+  摘要覆盖任务目标、约束、文件修改、工具结果、验证状态和后续步骤。
+  长历史分块处理，合并前一轮摘要并保留重叠；不静默截断历史。
+  成功后将摘要用 AES-256-GCM 加密为带版本的 compaction 项。
+  后续转发到**任一后端**前，router 将检查点恢复为普通的历史摘要消息，
+  因此本地→GPT→本地以及重复压缩都能携带摘要。恢复消息使用 user 角色并标明
+  “历史数据”，不把历史中的不可信内容提升为系统指令。
+  本地和 GPT 路由都使用这条摘要路径，避免新产生的检查点被锁定在某个后端。
+  摘要生成会增加当前后端的推理调用和费用；返回的 usage 汇总实际生成调用。
+- **失败保留历史**：空摘要、未完成响应、上游错误或超时不会返回成功检查点。
+  长压缩每 10 秒发送进行中事件；若之后失败，发送 SSE error 而不是 completed。
+  客户端取消时取消对应摘要请求。损坏、密钥不匹配或无法恢复的检查点返回 409，
+  不会悄悄删掉后继续生成。
 - **鉴权注入**：ChatGPT 后端路由若请求缺 `Authorization`（如 local_vlm 免鉴权
   provider 发出的请求），自动注入 `~/.codex/auth.json` 的 access_token。
 - **调试落盘**：`CODEX_ROUTER_LOG=1` 每行请求日志；`CODEX_ROUTER_DUMP=<dir>`
   落盘完整请求/响应（`<ts>_<model>.req.json` / `.resp.<code>`）。
+
+### 检查点恢复、备份和限制
+
+- 默认密钥文件为 `~/.codex/model-router/state/summary-key`；首次创建的目录权限为
+  0700，密钥文件为 0600。直接启动 router 时可用 `CODEX_ROUTER_STATE_DIR` 指定状态目录。
+  检查点自身携带加密摘要，不依赖进程内缓存或额外的摘要数据库。
+  这是路由器的私有检查点格式，恢复必须经过持有原密钥的 router，不能直接发往模型服务。
+- 重启、重装覆盖脚本后，只要保留同一密钥就可以恢复已有检查点。
+  迁移机器需要同时迁移会话及该状态目录。**备份状态目录；不要将密钥提交到 Git。**
+  当前 `--uninstall` 会删除整个 router 目录，也会删除默认密钥；卸载前需要自行备份。
+- 旧版固定占位符 `router_local_compaction_v1` 原本就没有摘要，无法事后恢复。
+  遇到它会明确报错，需要从压缩前的原始会话记录恢复，不能靠生成新密钥修复。
+- 既有的云端原生 compaction 只能由原云端解码。可在原云端模型上通过新版 router
+  再压缩一次，转换为可跨后端恢复的检查点；直接切到本地会返回 409。
+- 压缩需要完整 `input`，不支持只凭 `previous_response_id` 获取隐含历史。
+  图片会作为历史附件交给当前后端；音频/文件压缩尚未支持，会明确拒绝。
+- 这是模型生成的语义摘要，不是无损转录或加密 token 重放。摘要质量依赖所选模型；
+  测试覆盖协议、保存恢复和上下文传递，并不保证任意模型都能保留每个细节。
 
 ## 排查
 
@@ -127,7 +152,9 @@ codex doctor                                 # codex 侧诊断
 | 所有请求 400 `{"detail":"Bad Request"}` | model 解析失败走了兜底路由；查 router.log 的 `decoded body` 行，确认 node zstd 支持 |
 | 400 `body.include.1` / `output.encrypted_content` | vLLM schema 不支持客户端的加密输出 selector；更新本路由后再发请求 |
 | 切 GPT 模型 400 `Unknown parameter: input[N].status` | 外来 reasoning 项未剔除（router 版本过旧） |
-| `remote compaction v2 expected exactly one compaction output item` | router 未实现 V2 压缩合成（版本过旧） |
+| `remote compaction v2 expected exactly one compaction output item` | 检查 router 的压缩响应；新版仅在摘要成功后返回一个 compaction 输出项 |
+| 409 checkpoint/key/legacy placeholder | 检查点损坏、密钥缺失/不匹配，或旧占位符无法恢复；恢复原状态目录或压缩前的会话记录 |
+| Summary backend / incomplete / empty 错误 | 摘要没有完成，不会产生成功检查点；保留原历史，排查模型后端后重试 |
 | 部分模型 401 | app-server 走了 local_vlm provider 直连；确认 `[model_providers.local_vlm].base_url` 指向 router |
 | TUI 菜单不刷新 | app-server 未重启（config 只在进程启动时加载） |
 
@@ -161,8 +188,8 @@ codex doctor                                 # codex 侧诊断
 | 加密输出 selector | 0.164 / 0.166 源码在 `output_token_replay` 启用且 provider 为 OpenAI 时添加第二项；本次修复仅过滤本地后端不支持的该项。无需全局关闭功能，也不应删除所有未知字段。 |
 | 0.165 起的 reasoning effort 更新 | 本地 catalog 已设 `supports_reasoning_effort_updates: false`，继续用请求级参数，避免向不支持的后端发送 `configuration_update`。保留 `supports_reasoning_summary_parameter: false` 与 `use_responses_lite: false`，直到后端能力被验证。 |
 | 0.166 的传输与 catalog | 源码仍明确支持 426 后回退 HTTP，因此目前不需要实现 WebSocket 转发。新增模型与 catalog 元数据需要随 CLI 更新；0.166 只完成源码核对，尚未安装验证。 |
-| 长对话压缩：最高优先级 | 0.164 / 0.166 的历史重建会移除助手/工具项，依赖真正的 compaction 内容补回。应实现可恢复的真实摘要，或让本地会话使用 CLI 的本地压缩路径；固定占位符不能视为完成。验收必须检查压缩前的任务约束、文件修改和工具结果在压缩后仍可用。 |
-| 同会话跨模型切换 | 已有本地→GPT reasoning 清洗；仍需覆盖 GPT→本地、压缩后切换、恢复会话等组合。跨后端的不透明加密内容需按来源恢复，不能仅凭存在 `encrypted_content` 就假定目标后端可解码。 |
+| 长对话压缩 | 已用真实模型请求替代固定占位符，增加加密检查点与持久密钥。隔离测试验证任务约束、助手记录和工具结果在压缩、重启后可恢复；实际模型的摘要质量仍需在工作端点空闲时验证。 |
+| 同会话跨模型切换 | 新检查点由 router 恢复为历史文本，覆盖本地→GPT→本地、重复压缩和恢复会话。既有云端原生检查点需在原云端转换，不能直接交给本地解码。 |
 | 登录态 | 新版本使用共享运行时鉴权，凭据也可能存在 keyring。优先透传 CLI 的 Authorization 与账号头；只读 `~/.codex/auth.json` 的补注入仅是兜底，不能当作通用登录态接口。 |
 | 更新与回归 | 后续宜增加独立的 catalog 刷新命令和 CLI/后端版本诊断。升级前覆盖普通流式回复、工具调用、多轮、切换和压缩；通过后再更新工作环境。 |
 
@@ -179,16 +206,28 @@ codex doctor                                 # codex 侧诊断
 原生多 provider 同 picker 的
 [功能请求仍未关闭](https://github.com/openai/codex/issues/46484)，暂时没有据此移除路由器的依据。
 
-### 离线回归检查
+### 隔离回归检查
 
 ```bash
 bash -n install.sh
-node --test tests/router-compat.test.js
+node --test tests/*.test.js
+# 可选：同时使用已安装的真实 Codex CLI 验证压缩、模型切换和会话恢复
+CODEX_TEST_BINARY="$(command -v codex)" node --test tests/*.test.js
 ```
 
-测试直接提取安装脚本实际发布的 router，覆盖五种请求编码、本地 selector 过滤、
-ChatGPT 透传、鉴权边界、UTF-8 Content-Length 与旧请求兼容；不启动服务、不读取登录态、
-不访问 GPU 或外部模型。安装末尾的真实请求也携带两个 selector，防止简单 ping 漏过此次问题。
+测试直接提取安装脚本实际发布的 router，使用临时端口、临时状态目录与确定性的本地
+模拟后端。覆盖五种请求编码、鉴权边界、分块摘要、损坏/丢失检查点、失败/取消、长时间
+压缩的 SSE 进度，以及本地/GPT 双向切换和重启恢复。
+
+CLI 测试使用独立 `CODEX_HOME`，通过实际 `app-server` 发起工具调用、压缩、切换和恢复，
+唯一工具命令是固定的 `printf`。它检查助手新增的记录和工具实际输出在旧历史被过滤后
+仍然到达下一模型。不会连接生产模型、读取真实登录态或修改当前服务；临时产物位于
+忽略的 `.q3x-work/`，测试结束清理。
+
+2026-11-06 使用 Codex CLI 0.164.0 完成该隔离验证。它验证实际 CLI 与路由器的协议和
+上下文恢复，不构成真实 vLLM/GPT 推理质量的实测；为避免影响正在运行的任务，本轮没有
+部署或调用工作中的模型端点。安装末尾的真实请求也携带两个 selector，防止简单 ping
+漏过此前的 `include` 问题。
 
 ## License
 

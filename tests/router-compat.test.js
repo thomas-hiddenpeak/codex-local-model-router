@@ -39,7 +39,7 @@ function send(body, headers = {}) {
     require(name) {
       return name === 'http' || name === 'https' ? transport : require(name);
     },
-    process: { env: {} }, Buffer, console,
+    process: { env: {} }, Buffer, console, __dirname,
   });
   const req = new EventEmitter();
   Object.assign(req, {
