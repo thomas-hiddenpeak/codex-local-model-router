@@ -15,6 +15,7 @@
 #   - WS upgrade 一律回 426, 让 codex 回退 HTTPS
 #   - 跨模型切换: 转发 ChatGPT 后端前剔除无 encrypted_content 的 reasoning 项
 #     (本地 vLLM 产生的 reasoning 项会被后端 400/404 拒绝)
+#   - 本地 include 兼容: 过滤 vLLM 不支持的 output.encrypted_content
 #   - V2 远程压缩: 本地路由收到 compaction_trigger 不转发, 直接合成 codex 期望的
 #     compaction SSE 响应 (客户端本地重建历史, encrypted_content 是不透明 token);
 #     后续请求带回的 compaction 项转发 vLLM 前剔除
@@ -384,9 +385,9 @@ function stripForeignReasoning(body) {
 // V2 协议要求后端返回 SSE 流, 其中恰好一个 {"type":"compaction","encrypted_content":...}
 // 输出项 (collect_compaction_output 校验 compaction_count==1, 否则 fatal)。
 // 本地 vLLM 不认 compaction_trigger 会 400, 也给不出 compaction 项。
-// 关键: 客户端 build_v2_compacted_history 在本地做历史压缩 (按保留规则过滤 input +
-// 截断到 token 预算 + 追加 compaction 项), 后端的 encrypted_content 对客户端是不透明
-// token (只存回、下次请求带回)。所以 router 直接合成 compaction 响应即可, 无需 vLLM。
+// 当前兼容方案只合成协议占位项, 没有生成摘要。客户端 build_v2_compacted_history
+// 会过滤助手/工具历史并追加该项; 占位项无法保存被移除的信息。它能通过协议校验,
+// 不能提供语义压缩或无损续聊保证; 真正的摘要/恢复路径仍待实现。
 function hasCompactionTrigger(body) {
   try {
     const j = JSON.parse(body.toString('utf8'));
@@ -436,7 +437,7 @@ function respondSyntheticCompaction(req, res, model) {
 }
 
 // 后续请求会把 compaction 项 (含 encrypted_content) 带回 input; 本地 vLLM 不认会 400,
-// 转发前剔除。客户端本地已用该项重建历史, 剔除不影响语义。
+// 转发前剔除。该占位项不含可恢复的摘要, 因此此路径存在上下文丢失风险。
 function stripCompactionItem(body) {
   let j;
   try {
@@ -453,6 +454,24 @@ function stripCompactionItem(body) {
     return Buffer.from(JSON.stringify(j), 'utf8');
   }
   return body;
+}
+
+// New Codex clients request encrypted output items as well as reasoning.
+// The local vLLM Responses schema only accepts reasoning.encrypted_content;
+// remove the unsupported selector on this route without changing other includes.
+function stripUnsupportedLocalIncludes(body) {
+  let j;
+  try {
+    j = JSON.parse(body.toString('utf8'));
+  } catch (e) {
+    return body;
+  }
+  if (!Array.isArray(j.include) || !j.include.includes('output.encrypted_content')) {
+    return body;
+  }
+  j.include = j.include.filter((item) => item !== 'output.encrypted_content');
+  logLine('stripped unsupported output.encrypted_content include for local vllm');
+  return Buffer.from(JSON.stringify(j), 'utf8');
 }
 
 function forward(req, res, body, model, dumpBase) {
@@ -479,6 +498,7 @@ function forward(req, res, body, model, dumpBase) {
       return;
     }
     body = stripCompactionItem(body);
+    body = stripUnsupportedLocalIncludes(body);
   }
 
   const headers = {};
@@ -787,6 +807,8 @@ const body = JSON.stringify({
   model: model,
   input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'ping' }] }],
   max_output_tokens: 16,
+  // Exercise the selectors sent by current Codex clients, not just plain text.
+  include: ['reasoning.encrypted_content', 'output.encrypted_content'],
 });
 const r = http.request(
   { host: '127.0.0.1', port: Number(port), path: '/v1/responses', method: 'POST',
