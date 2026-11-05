@@ -26,7 +26,7 @@ function output(text, status = 'completed') {
   };
 }
 
-function sse(res, response) {
+function sse(res, response, contentType = 'text/event-stream') {
   const item = response.output[0];
   if (item.type === 'function_call') {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -52,7 +52,7 @@ function sse(res, response) {
     { type: response.status === 'completed' ? 'response.completed' : 'response.incomplete', response },
   ];
   const wire = Buffer.from(events.map((event) => 'event: ' + event.type + '\r\ndata: ' + JSON.stringify(event) + '\r\n\r\n').join(''));
-  res.writeHead(200, { 'content-type': 'text/event-stream' });
+  res.writeHead(200, contentType ? { 'content-type': contentType } : {});
   // Exercise UTF-8 decoding and SSE framing across arbitrary network boundaries.
   for (let i = 0; i < wire.length; i += 37) res.write(wire.subarray(i, i + 37));
   res.end();
@@ -99,9 +99,15 @@ async function backend(name) {
       const text = summary && state.mode === 'empty' ? '' :
         facts(JSON.stringify(body.input) + nativeFact + (summary ? '' : state.normalExtras)).join('\n') || 'Ready';
       const result = output(text, summary && state.mode === 'incomplete' ? 'incomplete' : 'completed');
-      if (summary && state.mode === 'json') {
+      if (summary && (state.mode === 'budget-always' ||
+          (['budget-once', 'json-budget-once'].includes(state.mode) && body.max_output_tokens < 16384))) {
+        result.status = 'incomplete';
+        result.incomplete_details = { reason: 'max_output_tokens' };
+      }
+      if (summary && ['json', 'json-budget-once'].includes(state.mode)) {
         res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(result));
-      } else sse(res, result);
+      } else sse(res, result, summary && state.mode === 'missing-content-type' ? null :
+        summary && state.mode === 'wrong-content-type' ? 'application/json' : 'text/event-stream');
     });
   });
   server.listen(0, '127.0.0.1');

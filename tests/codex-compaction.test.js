@@ -161,4 +161,12 @@ test('installed Codex compacts, switches both models, and resumes portable conte
   for (const fact of ['Implement_delta_paginator', 'Do_not_modify_live_service',
     'Patch_committed_A1', 'Fixture_tool_output_T4']) assert.ok(restored.includes(fact), fact);
   assert.ok(!f.local.requests.at(-1).body.input.some((item) => item.type === 'compaction'));
+
+  // Verify the real CLI reports the cause after progress headers were sent.
+  f.local.mode = 'delayed-error';
+  const cursor = cli.notifications.length;
+  await cli.call('thread/compact/start', { threadId });
+  const failure = await cli.wait('error', (p) => p.threadId === threadId &&
+    /Summary backend returned HTTP 503/.test((p.error?.message || '') + (p.error?.additionalDetails || '')), cursor);
+  assert.ok(!JSON.stringify(failure.error).includes('stream closed before response.completed'));
 });

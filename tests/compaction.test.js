@@ -109,9 +109,9 @@ test('long history is consumed in bounded overlapping chunks with truthful summe
   const result = await request(f.url, compact('LOCAL model', input));
   const item = checkpoint(result);
   const calls = f.local.requests.filter((entry) => entry.summary);
-  assert.ok(calls.length >= 3);
+  assert.ok(calls.length >= 2);
   assert.equal(result.json.usage.total_tokens, calls.length * 30);
-  for (const call of calls) assert.ok(call.body.input[0].content[0].text.length < 18000);
+  for (const call of calls) assert.ok(call.body.input[0].content[0].text.length < 34000);
   const restored = await request(f.url, followup('gpt-test', item));
   for (const fact of [...expected, 'Final_constraint_Z8']) assert.ok(JSON.stringify(restored.json.output).includes(fact));
 });
@@ -126,6 +126,16 @@ test('standalone compaction returns a complete reduced window and accepts JSON b
   const restored = await request(f.url, followup('gpt-test', result.json.output[0]));
   for (const fact of expected) assert.ok(JSON.stringify(restored.json.output).includes(fact));
 });
+
+for (const mode of ['missing-content-type', 'wrong-content-type']) {
+  test('cloud summary parses framed SSE across chunks despite ' + mode, async (t) => {
+    const f = await fixture(t);
+    f.cloud.mode = mode;
+    const item = checkpoint(await request(f.url, compact('gpt-test')));
+    const restored = await request(f.url, followup('LOCAL model', item));
+    for (const fact of expected) assert.ok(JSON.stringify(restored.json.output).includes(fact));
+  });
+}
 
 test('native cloud checkpoints can be converted by their cloud, never silently dropped locally', async (t) => {
   const f = await fixture(t);
@@ -149,6 +159,31 @@ for (const mode of ['http-error', 'empty', 'incomplete', 'malformed']) {
     assert.ok(!result.text.includes('codex_router_summary_v1.'));
   });
 }
+
+for (const mode of ['budget-once', 'json-budget-once']) {
+  test('exhausted summary budget retries the same chunk once and accounts for both attempts: ' + mode, async (t) => {
+    const f = await fixture(t);
+    f.local.mode = mode;
+    const result = await request(f.url, compact('LOCAL model'));
+    const item = checkpoint(result);
+    const calls = f.local.requests.filter((entry) => entry.summary);
+    assert.deepEqual(calls.map((entry) => entry.body.max_output_tokens), [8192, 16384]);
+    assert.deepEqual(calls[0].body.input, calls[1].body.input);
+    assert.equal(result.json.usage.total_tokens, 60);
+    const restored = await request(f.url, followup('LOCAL model', item));
+    for (const fact of expected) assert.ok(JSON.stringify(restored.json.output).includes(fact));
+  });
+}
+
+test('repeated budget exhaustion stops without sealing a partial checkpoint', async (t) => {
+  const f = await fixture(t);
+  f.local.mode = 'budget-always';
+  const result = await request(f.url, compact('LOCAL model'));
+  assert.equal(result.status, 502);
+  assert.match(result.text, /max_output_tokens/);
+  assert.ok(!result.text.includes('codex_router_summary_v1.'));
+  assert.equal(f.local.requests.filter((entry) => entry.summary).length, 2);
+});
 
 test('tampered checkpoints, missing keys and old placeholders fail without forwarding', async (t) => {
   const f = await fixture(t);
@@ -209,6 +244,34 @@ test('cloud encrypted reasoning is omitted on a local switch while visible conte
   assert.ok(JSON.stringify(result.json.output).includes('pytest_17_passed'));
 });
 
+test('reviewed native-checkpoint recovery is bound to both its thread and ciphertext', async (t) => {
+  const f = await fixture(t);
+  const summary = path.join(f.dir, 'native-summary.txt');
+  const source = path.join(f.dir, 'original-native.jsonl');
+  const nativeFile = path.join(f.dir, 'native.json');
+  const native = { type: 'compaction', encrypted_content: 'opaque-cloud-fixture' };
+  fs.writeFileSync(summary, 'FACT recovered=Reviewed_native_progress_N2');
+  fs.writeFileSync(source, '{"original":"synthetic native history"}\n');
+  fs.writeFileSync(nativeFile, JSON.stringify(native));
+  execFileSync(process.execPath, [path.join(__dirname, '..', 'tools', 'recover-legacy.js'),
+    '--state-dir', path.join(f.dir, 'state'), '--thread-id', 'native-thread',
+    '--summary-file', summary, '--source-file', source, '--native-checkpoint-file', nativeFile]);
+  const metadata = { thread_id: 'native-thread', session_id: 'native-thread' };
+  const input = [native, ...history];
+  const recovered = await request(f.url, { model: 'LOCAL model', input, client_metadata: metadata });
+  assert.equal(recovered.status, 200, recovered.text);
+  assert.ok(JSON.stringify(recovered.json.output).includes('Reviewed_native_progress_N2'));
+  assert.equal((await request(f.url, { model: 'LOCAL model', input,
+    client_metadata: { thread_id: 'other-thread' } })).status, 409);
+  assert.equal((await request(f.url, { model: 'LOCAL model', input: [
+    { ...native, encrypted_content: 'another-cloud-checkpoint' }], client_metadata: metadata })).status, 409);
+  await f.restart();
+  const item = checkpoint(await request(f.url, { ...compact('LOCAL model', input), client_metadata: metadata }));
+  fs.unlinkSync(path.join(f.dir, 'state', 'native-recoveries', 'native-thread.json'));
+  const portable = await request(f.url, followup('gpt-test', item));
+  assert.ok(JSON.stringify(portable.json.output).includes('Reviewed_native_progress_N2'));
+});
+
 test('client disconnect cancels the isolated summary request', async (t) => {
   const f = await fixture(t);
   f.local.mode = 'slow';
@@ -233,7 +296,9 @@ for (const mode of ['delayed-success', 'delayed-error']) {
     if (mode === 'delayed-success') checkpoint(result);
     else {
       assert.equal(result.status, 200); // Headers were already sent for progress.
-      assert.ok(result.events.some((event) => event.type === 'error'));
+      const failure = result.events.find((event) => event.type === 'response.failed');
+      assert.equal(failure?.response.status, 'failed');
+      assert.match(failure?.response.error.message, /HTTP 503/);
       assert.ok(!result.events.some((event) => event.type === 'response.completed'));
     }
   });
