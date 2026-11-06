@@ -605,6 +605,17 @@ function summaryResponseError(response, fallback) {
   return error;
 }
 
+// The ChatGPT backend re-validates its internal request contract on every
+// request, including the summary requests this router synthesizes from a caller
+// request that opted into the responses-lite path. Replaying that header without
+// reasoning.context=all_turns is answered HTTP 400, which used to end the
+// caller's turn as a router 502. Local vLLM accepts only `effort`, so its
+// summary payload stays unchanged.
+function summaryReasoning(req, route) {
+  const lite = route.passthroughAuth && req.headers['x-openai-internal-codex-responses-lite'];
+  return lite ? { effort: 'low', context: 'all_turns' } : { effort: 'low' };
+}
+
 function generateSummary(req, route, payload, signal) {
   const body = Buffer.from(JSON.stringify(payload));
   const headers = requestHeaders(req, route, body);
@@ -734,7 +745,7 @@ async function respondRealCompaction(req, res, body, model, route) {
       if (end < transcript.length && /[\uD800-\uDBFF]/.test(transcript[end - 1])) end--;
       const payload = {
         model, instructions: SUMMARY_INSTRUCTIONS, store: false, stream: true,
-        tools: [], tool_choice: 'none', reasoning: { effort: 'low' },
+        tools: [], tool_choice: 'none', reasoning: summaryReasoning(req, route),
         input: [...attachments, { type: 'message', role: 'user', content: [{
           type: 'input_text', text: 'Previous continuation summary:\n' + (summary || '(none)') +
             '\n\nNext historical transcript chunk:\n' + transcript.slice(start, end),
@@ -958,10 +969,25 @@ function forward(req, res, body, model, dumpBase) {
   } catch (err) {
     sendError(res, err); return;
   }
-  if (hasCompactionTrigger(body) || fwdPath.split('?')[0] === '/responses/compact') {
-    respondRealCompaction(req, res, body, model, route).catch((err) => sendError(res, err));
+  const standalone = fwdPath.split('?')[0] === '/responses/compact';
+  if (standalone || hasCompactionTrigger(body)) {
+    respondRealCompaction(req, res, body, model, route).catch((err) => {
+      // A cloud route already has a working native compaction path. When the
+      // portable checkpoint cannot be produced, hand the caller's original
+      // request upstream instead of ending its turn with a router 502.
+      if (route.passthroughAuth && !res.headersSent) {
+        logLine(`Router compaction unavailable for cloud route (${err.message}); using native upstream compaction`);
+        forwardRequest(req, res, body, model, route, fwdPath, dumpBase);
+        return;
+      }
+      sendError(res, err);
+    });
     return;
   }
+  forwardRequest(req, res, body, model, route, fwdPath, dumpBase);
+}
+
+function forwardRequest(req, res, body, model, route, fwdPath, dumpBase) {
   let targetUrl;
   try {
     targetUrl = new URL(route.target + fwdPath);

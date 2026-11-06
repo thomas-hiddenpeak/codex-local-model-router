@@ -35,6 +35,7 @@ test('real backend summary restores assistant/tool facts after restart and both 
   const f = await fixture(t);
   const item = checkpoint(await request(f.url, compact('LOCAL model')));
   const summaryCall = f.local.requests.find((entry) => entry.summary);
+  assert.deepEqual(summaryCall.body.reasoning, { effort: 'low' });
   assert.ok(summaryCall.body.input[0].content[0].text.includes('function_call_output'));
   assert.equal(summaryCall.headers.authorization, undefined);
   assert.deepEqual(summaryCall.body.tools, []);
@@ -303,3 +304,36 @@ for (const mode of ['delayed-success', 'delayed-error']) {
     }
   });
 }
+
+test('cloud compaction replays the backend lite header with reasoning.context=all_turns', async (t) => {
+  const f = await fixture(t);
+  const item = checkpoint(await request(f.url, compact('gpt-test'), '/v1/responses',
+    { 'x-openai-internal-codex-responses-lite': 'true' }));
+  const summaryCall = f.cloud.requests.find((entry) => entry.summary);
+  assert.ok(summaryCall, 'no router summary request reached the cloud backend');
+  assert.equal(summaryCall.headers['x-openai-internal-codex-responses-lite'], 'true');
+  assert.equal(summaryCall.body.reasoning.context, 'all_turns');
+  const result = await request(f.url, followup('gpt-test', item));
+  assert.equal(result.status, 200, result.text);
+  for (const fact of expected) assert.ok(JSON.stringify(result.json.output).includes(fact), 'lost ' + fact);
+  // vLLM rejects unknown reasoning fields, so the local route keeps effort only.
+  await request(f.url, compact('LOCAL model'), '/v1/responses',
+    { 'x-openai-internal-codex-responses-lite': 'true' });
+  assert.deepEqual(f.local.requests.find((entry) => entry.summary).body.reasoning, { effort: 'low' });
+});
+
+test('cloud route keeps its native compaction when the router summary is rejected', async (t) => {
+  const f = await fixture(t);
+  f.cloud.mode = 'summary-rejected';
+  const result = await request(f.url, compact('gpt-test'));
+  assert.equal(result.status, 200, result.text);
+  assert.ok(f.cloud.requests.some((entry) => !entry.summary &&
+    entry.body.input?.some((item) => item.type === 'compaction_trigger')),
+    'the original compaction request was never handed to the cloud backend');
+  for (const fact of expected) assert.ok(JSON.stringify(result.json.output).includes(fact), 'lost ' + fact);
+  // A local route has no native compaction to fall back to, so it must stay explicit.
+  f.local.mode = 'summary-rejected';
+  const local = await request(f.url, compact('LOCAL model'));
+  assert.equal(local.status, 502);
+  assert.match(local.text, /Summary backend returned HTTP 400/);
+});

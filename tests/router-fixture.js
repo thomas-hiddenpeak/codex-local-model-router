@@ -68,6 +68,19 @@ async function backend(name) {
       const body = JSON.parse(Buffer.concat(chunks));
       const summary = body.instructions?.startsWith('Create a factual continuation summary');
       state.requests.push({ body, headers: req.headers, summary });
+      // Mirror the ChatGPT backend contract: a request that replays the internal
+      // responses-lite header must declare reasoning.context=all_turns.
+      if (summary && name === 'cloud' && req.headers['x-openai-internal-codex-responses-lite'] &&
+          body.reasoning?.context !== 'all_turns') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message:
+          'X-OpenAI-Internal-Codex-Responses-Lite requires `reasoning.context` to be `all_turns`.' } }));
+        return;
+      }
+      if (summary && state.mode === 'summary-rejected') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'summary generation rejected' } })); return;
+      }
       if (!summary && state.callTool) {
         state.callTool = false;
         sse(res, { ...output(''), output: [{
@@ -168,9 +181,10 @@ async function fixture(t) {
   return value;
 }
 
-async function request(url, body, route = '/v1/responses') {
+async function request(url, body, route = '/v1/responses', extraHeaders = {}) {
   const res = await fetch(url + route, {
-    method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer test-only' },
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer test-only', ...extraHeaders },
     body: JSON.stringify(body),
   });
   const text = await res.text();
