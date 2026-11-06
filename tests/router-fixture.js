@@ -27,30 +27,30 @@ function output(text, status = 'completed') {
 }
 
 function sse(res, response, contentType = 'text/event-stream') {
-  const item = response.output[0];
-  if (item.type === 'function_call') {
-    res.writeHead(200, { 'content-type': 'text/event-stream' });
-    for (const event of [
-      { type: 'response.created', response: { ...response, output: [], status: 'in_progress' } },
-      { type: 'response.output_item.added', output_index: 0, item: { ...item, arguments: '' } },
-      { type: 'response.function_call_arguments.delta', item_id: item.id, output_index: 0, delta: item.arguments },
-      { type: 'response.output_item.done', output_index: 0, item },
-      { type: 'response.completed', response },
-    ]) res.write('event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n');
-    res.end(); return;
+  const events = [{ type: 'response.created', response: { ...response, output: [], status: 'in_progress' } }];
+  for (const [output_index, item] of response.output.entries()) {
+    const ids = { item_id: item.id, output_index };
+    events.push({ type: 'response.output_item.added', output_index,
+      item: { ...item, ...(item.type === 'function_call' ? { arguments: '' } : { content: [] }) } });
+    if (item.type === 'function_call') {
+      events.push({ type: 'response.function_call_arguments.delta', ...ids, delta: item.arguments });
+    } else {
+      for (const [content_index, part] of (item.content || []).entries()) {
+        const kind = part.type === 'reasoning_text' ? 'reasoning_text' : 'output_text';
+        events.push({ type: 'response.content_part.added', ...ids, content_index,
+          part: { ...part, text: '' } });
+        const text = part.text;
+        const mid = Math.ceil(text.length / 2);
+        for (const delta of [text.slice(0, mid), text.slice(mid)]) {
+          events.push({ type: 'response.' + kind + '.delta', ...ids, content_index, delta });
+        }
+        events.push({ type: 'response.' + kind + '.done', ...ids, content_index, text });
+        events.push({ type: 'response.content_part.done', ...ids, content_index, part });
+      }
+    }
+    events.push({ type: 'response.output_item.done', output_index, item });
   }
-  const events = [
-    { type: 'response.created', response: { ...response, output: [], status: 'in_progress' } },
-    { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
-    { type: 'response.content_part.added', item_id: item.id, output_index: 0, content_index: 0,
-      part: { type: 'output_text', text: '', annotations: [] } },
-    { type: 'response.output_text.delta', item_id: item.id, output_index: 0, content_index: 0,
-      delta: item.content[0].text },
-    { type: 'response.output_text.done', item_id: item.id, output_index: 0, content_index: 0,
-      text: item.content[0].text },
-    { type: 'response.output_item.done', output_index: 0, item },
-    { type: response.status === 'completed' ? 'response.completed' : 'response.incomplete', response },
-  ];
+  events.push({ type: response.status === 'completed' ? 'response.completed' : 'response.incomplete', response });
   const wire = Buffer.from(events.map((event) => 'event: ' + event.type + '\r\ndata: ' + JSON.stringify(event) + '\r\n\r\n').join(''));
   res.writeHead(200, contentType ? { 'content-type': contentType } : {});
   // Exercise UTF-8 decoding and SSE framing across arbitrary network boundaries.
@@ -59,7 +59,8 @@ function sse(res, response, contentType = 'text/event-stream') {
 }
 
 async function backend(name) {
-  const state = { name, requests: [], mode: 'ok', canceled: 0, normalExtras: '', callTool: false };
+  const state = { name, requests: [], mode: 'ok', canceled: 0, normalExtras: '', callTool: false,
+    normalReasoning: '', nativeSummary: [] };
   const server = http.createServer((req, res) => {
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
@@ -99,12 +100,17 @@ async function backend(name) {
       const text = summary && state.mode === 'empty' ? '' :
         facts(JSON.stringify(body.input) + nativeFact + (summary ? '' : state.normalExtras)).join('\n') || 'Ready';
       const result = output(text, summary && state.mode === 'incomplete' ? 'incomplete' : 'completed');
+      if (!summary && (state.normalReasoning || state.nativeSummary.length)) {
+        const texts = Array.isArray(state.normalReasoning) ? state.normalReasoning : [state.normalReasoning];
+        result.output.unshift({ type: 'reasoning', id: 'rs_fixture', summary: state.nativeSummary,
+          content: texts.filter(Boolean).map((text) => ({ type: 'reasoning_text', text })) });
+      }
       if (summary && (state.mode === 'budget-always' ||
           (['budget-once', 'json-budget-once'].includes(state.mode) && body.max_output_tokens < 16384))) {
         result.status = 'incomplete';
         result.incomplete_details = { reason: 'max_output_tokens' };
       }
-      if (summary && ['json', 'json-budget-once'].includes(state.mode)) {
+      if (state.mode === 'json' || (summary && state.mode === 'json-budget-once')) {
         res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(result));
       } else sse(res, result, summary && state.mode === 'missing-content-type' ? null :
         summary && state.mode === 'wrong-content-type' ? 'application/json' : 'text/event-stream');

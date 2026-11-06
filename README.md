@@ -94,6 +94,11 @@ codex        # 或你的启动方式, 如 codex --yolo
   部分 vLLM 的 Responses schema 不接受第二项。router 仅在本地路由过滤
   `output.encrypted_content`，保留其他 selector；ChatGPT 路由继续透传。
   这处理的是可选的加密输出请求，不是改名为 reasoning 或改写模型输入。
+- **本地思考展示**：将本地 vLLM 的明文 `reasoning_text` 转成带“思考过程”标题的
+  `reasoning_summary_text` 事件与 `summary_text` 项，供桌面端按思考标题展示和折叠。
+  标题是展示标签，后面保留完整原文；后续推理和压缩前会还原原始 reasoning。
+  这不减少思考 token，也不增加摘要模型调用。正文、工具调用和云端响应保持原有语义；
+  已保存的旧思考块不会被改写。具体默认展开状态仍由桌面端决定。
 - **跨模型切换清洗**：同对话先用本地模型再切 GPT 模型时，本地 vLLM 产生的
   reasoning 项（无 `encrypted_content`）会被 ChatGPT 后端 400/404 拒绝。
   router 转发 ChatGPT 后端前剔除这类项；切回本地时移除云端加密 reasoning，

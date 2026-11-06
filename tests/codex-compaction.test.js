@@ -133,17 +133,26 @@ test('installed Codex compacts, switches both models, and resumes portable conte
     assert.equal(done.turn.status, 'completed', JSON.stringify(done));
   }
   f.local.normalExtras = 'FACT assistant=Patch_committed_A1';
+  f.local.normalReasoning = 'FACT reasoning=Preserve_local_decision_Q2';
   f.local.callTool = true;
   await turn('LOCAL model', 'FACT goal=Implement_delta_paginator FACT constraint=Do_not_modify_live_service');
   const command = cli.notifications.find((entry) => entry.method === 'item/completed' && entry.params.item.type === 'commandExecution');
   assert.equal(command?.params.item.exitCode, 0, JSON.stringify(command));
+  const reasoning = cli.notifications.find((entry) => entry.method === 'item/completed' && entry.params.item.type === 'reasoning');
+  assert.ok(reasoning?.params.item.summary[0].startsWith('**思考过程**\n\n'));
+  assert.ok(reasoning.params.item.summary[0].includes('Preserve_local_decision_Q2'));
+  assert.deepEqual(reasoning.params.item.content, []);
+  assert.ok(cli.notifications.some((entry) => entry.method === 'item/reasoning/summaryTextDelta'));
+  assert.ok(!cli.notifications.some((entry) => entry.method === 'item/reasoning/textDelta'));
   const toolResult = f.local.requests.at(-1).body.input.find((item) => item.type === 'function_call_output' && item.call_id === 'call_fixture');
   assert.ok(JSON.stringify(toolResult?.output).includes('Fixture_tool_output_T4'));
   f.local.normalExtras = '';
+  f.local.normalReasoning = '';
   await compactThread();
   const firstSummary = JSON.stringify(f.local.requests.find((entry) => entry.summary).body.input);
   assert.ok(firstSummary.includes('Patch_committed_A1'));
   assert.ok(firstSummary.includes('Fixture_tool_output_T4'));
+  assert.ok(firstSummary.includes('Preserve_local_decision_Q2'));
   await turn('gpt-test', 'Recall previous facts and continue.');
   const cloudInput = JSON.stringify(f.cloud.requests.at(-1).body.input);
   assert.ok(cloudInput.includes('Patch_committed_A1'));
@@ -159,7 +168,7 @@ test('installed Codex compacts, switches both models, and resumes portable conte
   await turn('LOCAL model', 'Recall all previous facts after resume.');
   const restored = JSON.stringify(f.local.requests.at(-1).body.input);
   for (const fact of ['Implement_delta_paginator', 'Do_not_modify_live_service',
-    'Patch_committed_A1', 'Fixture_tool_output_T4']) assert.ok(restored.includes(fact), fact);
+    'Patch_committed_A1', 'Fixture_tool_output_T4', 'Preserve_local_decision_Q2']) assert.ok(restored.includes(fact), fact);
   assert.ok(!f.local.requests.at(-1).body.input.some((item) => item.type === 'compaction'));
 
   // Verify the real CLI reports the cause after progress headers were sent.
